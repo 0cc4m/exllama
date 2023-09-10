@@ -12,7 +12,7 @@ if torch.version.hip:
 
 setup(
     name="exllama",
-    version="0.0.6",
+    version="0.0.7",
     install_requires=[
         "torch",
     ],

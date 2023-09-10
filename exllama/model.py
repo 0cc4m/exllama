@@ -9,6 +9,10 @@ from enum import Enum
 
 from . import cuda_ext
 
+try:
+    from flash_attn import flash_attn_func
+except:
+    pass
 
 class ParsedEnum(Enum):
 
@@ -37,9 +41,9 @@ class ExLlamaConfig:
 
         # Loaded/automatic settings
 
-        self.bos_token_id = read_config["bos_token_id"]  # Note that the HF LlamaTokenizer doesn't seem to recognize these automatically
-        self.eos_token_id = read_config["eos_token_id"]
-        self.pad_token_id = read_config["pad_token_id"]
+        self.bos_token_id = read_config["bos_token_id"] if "bos_token_id" in read_config else 1
+        self.eos_token_id = read_config["eos_token_id"] if "eos_token_id" in read_config else 2
+        self.pad_token_id = read_config["pad_token_id"] if "pad_token_id" in read_config else 0
 
         self.hidden_size = read_config["hidden_size"]
         self.initializer_range = read_config["initializer_range"]
@@ -56,7 +60,7 @@ class ExLlamaConfig:
             self.num_key_value_heads = self.num_attention_heads
             self.num_key_value_groups = 1
 
-        self.rotary_embedding_base = 10000  # Constant used for pretrained models, leave as is unless retraining
+        self.rotary_embedding_base = read_config["rope_theta"] if "rope_theta" in read_config else 10000.0
         self.head_dim = self.hidden_size // self.num_attention_heads
 
         self.groupsize = None  # Autodetected
@@ -65,7 +69,7 @@ class ExLlamaConfig:
 
         # Required settings
 
-        self.model_path = None
+        self.model_path = None  # str or list[str]
         self.device_map = ExLlamaDeviceMap(self.num_hidden_layers)
 
         # Optional settings
@@ -80,6 +84,7 @@ class ExLlamaConfig:
 
         # Tuning
 
+        self.use_flash_attn_2 = False
         self.matmul_recons_thd = 8
         self.fused_mlp_thd = 2
         self.sdp_thd = 8
@@ -114,6 +119,7 @@ class ExLlamaConfig:
 
     def calculate_rotary_embedding_base(self):
         self.rotary_embedding_base = self.rotary_embedding_base * self.alpha_value ** (self.head_dim / (self.head_dim-2))
+
 
 # 4-bit linear layer implementation
 
@@ -351,7 +357,7 @@ class ExLlamaAttention:
                                      self.config.head_dim,
                                      cache.key_states[self.index],
                                      cache.value_states[self.index],
-                                     self.config.max_seq_len,
+                                     cache.max_seq_len,
                                      q_a, q_b,
                                      k_a, k_b,
                                      v_a, v_b,
@@ -361,8 +367,8 @@ class ExLlamaAttention:
 
         # Get k, v with past
 
-        key_states = cache.key_states[self.index].narrow(2, 0, past_len + q_len)
-        value_states = cache.value_states[self.index].narrow(2, 0, past_len + q_len)
+        key_states = cache.key_states[self.index].narrow(2, 0, past_len + q_len).narrow(0, 0, bsz)
+        value_states = cache.value_states[self.index].narrow(2, 0, past_len + q_len).narrow(0, 0, bsz)
 
         # Repeat K/V heads if num_key_value_headsn_kv_heads < n_heads
 
@@ -374,12 +380,26 @@ class ExLlamaAttention:
         # TODO: Figure out if we can use cublasHgemmStridedBatched() to do this matmul without reshaping. Torch uses
         # gemmStridedBatchedEx() internally, so it should be possible.
 
-        key_states.transpose_(2, 3)
-        attn_weights = torch.matmul(query_states, key_states)
-        attn_weights /= math.sqrt(self.config.head_dim)
-        attn_weights = nn.functional.softmax(attn_weights, dim = -1, dtype = torch.float16)
-        attn_output = torch.matmul(attn_weights, value_states)
-        attn_output = attn_output.transpose(1, 2)
+        # -- Flash Attention 2.0
+
+        if self.config.use_flash_attn_2 and (past_len == 0 or q_len == 1):
+
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
+            query_states = query_states.transpose(1, 2)
+            attn_output = flash_attn_func(query_states, key_states, value_states, causal = (past_len == 0))
+
+        # -- HF Transformers regular attention, faster on shorter sequences, same VRAM usage
+
+        else:
+
+            key_states.transpose_(2, 3)
+            attn_weights = torch.matmul(query_states, key_states)
+            attn_weights /= math.sqrt(self.config.head_dim)
+            attn_weights = nn.functional.softmax(attn_weights, dim = -1, dtype = torch.float16)
+            attn_output = torch.matmul(attn_weights, value_states)
+            attn_output = attn_output.transpose(1, 2)
+
         attn_output = attn_output.reshape(bsz, q_len, self.config.hidden_size)
 
         # Output projection
@@ -411,26 +431,33 @@ class ExLlamaAttention:
 
         # Add keys and values to cache
 
-        new_keys = cache.key_states[self.index].narrow(2, past_len, q_len)
-        new_values = cache.value_states[self.index].narrow(2, past_len, q_len)
+        new_keys = cache.key_states[self.index].narrow(2, past_len, q_len).narrow(0, 0, bsz)
+        new_values = cache.value_states[self.index].narrow(2, past_len, q_len).narrow(0, 0, bsz)
         new_keys.copy_(key_states)
         new_values.copy_(value_states)
 
         # Key/value tensors with past
 
-        key_states = cache.key_states[self.index].narrow(2, 0, past_len + q_len)
-        value_states = cache.value_states[self.index].narrow(2, 0, past_len + q_len)
-
-        # Repeat K/V heads if num_key_value_headsn_kv_heads < n_heads
-
-        key_states = self.repeat_kv(key_states, self.config.num_key_value_groups)
-        value_states = self.repeat_kv(value_states, self.config.num_key_value_groups)
+        key_states = cache.key_states[self.index].narrow(2, 0, past_len + q_len).narrow(0, 0, bsz)
+        value_states = cache.value_states[self.index].narrow(2, 0, past_len + q_len).narrow(0, 0, bsz)
 
         # Attention
 
+        # -- Flash Attention 2.0
+
+        if self.config.use_flash_attn_2 and (past_len == 0 or q_len == 1):
+
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
+            query_states = query_states.transpose(1, 2)
+            attn_output = flash_attn_func(query_states, key_states, value_states, causal = (past_len == 0))
+
         # -- HF Transformers regular attention, faster on shorter sequences, same VRAM usage
 
-        if self.config.sdp_thd == 0 or q_len < self.config.sdp_thd:
+        elif self.config.sdp_thd == 0 or q_len < self.config.sdp_thd:
+
+            key_states = self.repeat_kv(key_states, self.config.num_key_value_groups)
+            value_states = self.repeat_kv(value_states, self.config.num_key_value_groups)
 
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
             attn_weights /= math.sqrt(self.config.head_dim)
@@ -446,6 +473,13 @@ class ExLlamaAttention:
             # Torch's SDP attention has a built-in causal mask feature which we can use only when there is no past, i.e.
             # it can only apply a square attention mask. It saves quite a bit of VRAM but in practice Torch seems to use
             # the same amount of memory at peak anyway.
+            #
+            # TODO: Apparently flash attention is disabled when supplying an attention mask tensor. Figure out if this
+            # is true and maybe drop SDP altogether. If causal masking in flash-attn is updated eventually there should
+            # be no need for this anyway.
+
+            key_states = self.repeat_kv(key_states, self.config.num_key_value_groups)
+            value_states = self.repeat_kv(value_states, self.config.num_key_value_groups)
 
             if past_len > 0 or (bsz > 1 and buffer.attn_mask is not None):
                 attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask = buffer.attn_mask, is_causal = False)
@@ -686,26 +720,26 @@ class ExLlama:
 
         self.config.set_tuning_params()
 
-        # Load model weights
+        # Read tensor list from file(s)
 
-        tensors = {}
-        with safe_open(self.config.model_path, framework = "pt", device = "cpu") as f:
+        if isinstance(self.config.model_path, str): model_path = [self.config.model_path]
+        else: model_path = self.config.model_path
 
-            # Begin auto mapping if enabled
+        # Read tensor list from file(s), and measure layer sizes
 
-            decoder_size = 0
-            norm_size = 0
-            head_size = 0
-            half_element_size = torch.tensor([], dtype = torch.float16).element_size()
+        load_keys = {}
 
-            if self.config.auto_map is not None:
+        decoder_size = 0
+        norm_size = 0
+        head_size = 0
 
-                self.config.device_map.embed_tokens = "cpu"
-                self.config.device_map.layers = ["cuda:0"] + ["?"] * (self.config.num_hidden_layers - 1)
-
+        for path in model_path:
+            with safe_open(path, framework = "pt", device = "cpu") as f:
                 for key in f.keys():
 
                     if _skip_key(key): continue
+
+                    load_keys[key] = path
 
                     if key.startswith("model.layers.0."):
                         tensor_slice = f.get_slice(key)
@@ -725,56 +759,58 @@ class ExLlama:
                         head_size += math.prod(shape) * _layer_dtype_size(key)
                         del tensor_slice
 
-                # Assign layers automatically
+        # Begin auto mapping if enabled
 
-                device_usage = 0
-                device_index = 0
-                layer_index_device = 0
-                max_usage = self.config.auto_map[device_index] * (1024 ** 3)
+        if self.config.auto_map is not None:
 
-                for layer in range(self.config.num_hidden_layers + 2):
+            self.config.device_map.embed_tokens = "cpu"
+            self.config.device_map.layers = ["cuda:0"] + ["?"] * (self.config.num_hidden_layers - 1)
 
-                    this_layer_size = decoder_size
-                    if layer == self.config.num_hidden_layers + 0: this_layer_size = norm_size
-                    elif layer == self.config.num_hidden_layers + 1: this_layer_size = head_size
+            # Assign layers automatically
 
-                    while device_usage + this_layer_size > max_usage:
-                        device_index += 1
-                        device_usage = 0
-                        layer_index_device = 0
-                        max_usage = self.config.auto_map[device_index] * (1024 ** 3)
-                        if device_index >= len(self.config.auto_map): raise ValueError("Model too large for device allocation scheme.")
+            device_usage = 0
+            device_index = 0
+            layer_index_device = 0
+            max_usage = self.config.auto_map[device_index] * (1024 ** 3)
 
-                    target = f"cuda:{device_index}"
-                    if layer == self.config.num_hidden_layers + 0: self.config.device_map.norm = target
-                    elif layer == self.config.num_hidden_layers + 1: self.config.device_map.lm_head = target
-                    else: self.config.device_map.layers[layer] = f"cuda:{device_index}"
+            for layer in range(self.config.num_hidden_layers + 2):
 
-                    device_usage += this_layer_size
-                    layer_index_device += 1
+                this_layer_size = decoder_size
+                if layer == self.config.num_hidden_layers + 0: this_layer_size = norm_size
+                elif layer == self.config.num_hidden_layers + 1: this_layer_size = head_size
 
-        # Read tensor list from file
+                while device_usage + this_layer_size > max_usage:
+                    device_index += 1
+                    device_usage = 0
+                    layer_index_device = 0
+                    max_usage = self.config.auto_map[device_index] * (1024 ** 3)
+                    if device_index >= len(self.config.auto_map): raise ValueError("Model too large for device allocation scheme.")
 
-        load_keys = []
-        with safe_open(self.config.model_path, framework = "pt", device = "cpu") as f:
-            for key in f.keys():
-                load_keys.append(key)
+                target = f"cuda:{device_index}"
+                if layer == self.config.num_hidden_layers + 0: self.config.device_map.norm = target
+                elif layer == self.config.num_hidden_layers + 1: self.config.device_map.lm_head = target
+                else: self.config.device_map.layers[layer] = f"cuda:{device_index}"
 
-        # Load up to 1 GB of tensors at a time, closing and reopening the file in between each chunk
+                device_usage += this_layer_size
+                layer_index_device += 1
+
+         # Load up to 1 GB of tensors at a time, closing and reopening the file in between each chunk
 
         max_dq_buffer_size = 0
-        f = None
+        tensors = {}
+
         st_mem = 0
         MAX_ST_MEM = 1024**3
+        f = None
+        prev_path = ""
+        for key, path in load_keys.items():
 
-        for key in load_keys:
-
-            if _skip_key(key): continue
             device = self.config.device_map.map(key)
 
-            if f is None or st_mem > MAX_ST_MEM:
+            if f is None or st_mem > MAX_ST_MEM or path != prev_path:
                 if f is not None: del f
-                f = safe_open(self.config.model_path, framework = "pt", device = "cpu")
+                f = safe_open(path, framework = "pt", device = "cpu")
+                prev_path = path
                 st_mem = 0
 
             tensor = f.get_tensor(key)
@@ -788,10 +824,13 @@ class ExLlama:
             if key.endswith(".input_layernorm.weight"): tensor = tensor.half()
             if key.endswith(".post_attention_layernorm.weight"): tensor = tensor.half()
 
-            tensor = tensor.to(device, non_blocking = True)
-            if key.endswith(".qweight"): max_dq_buffer_size = max(max_dq_buffer_size, tensor.numel() * 8)
+            if device == "cpu": keep_tensor = tensor.clone()
+            else: keep_tensor = tensor.to(device)
+            del tensor
 
-            tensors[key] = tensor
+            if key.endswith(".qweight"): max_dq_buffer_size = max(max_dq_buffer_size, keep_tensor.numel() * 8)
+
+            tensors[key] = keep_tensor
 
         del f
 
@@ -805,6 +844,8 @@ class ExLlama:
 
         self.embed_tokens = nn.Embedding(self.config.vocab_size, self.config.hidden_size, self.config.pad_token_id, device = "meta")
         self.embed_tokens.weight = nn.Parameter(tensors["model.embed_tokens.weight"])
+        with torch.no_grad():
+            self.embed_tokens.weight[self.config.pad_token_id] = 0
 
         # Norm
 
@@ -886,10 +927,14 @@ class ExLlama:
         q_len = input_ids.shape[-1]
         remaining_q_len = q_len
         bsz = input_ids.shape[0]
+
+        assert input_mask is None or (input_mask.shape[-1] >= input_ids.shape[-1] and input_mask.shape[-2] == input_ids.shape[-2])
+
         # The buffers can only fit max_input_len tokens, so with larger batch sizes we reduce our work size correspondingly.
+
         effective_max_input_len = self.config.max_input_len // bsz
 
-        # Split forward pass
+        # Split sequence
 
         result = None
 
@@ -900,14 +945,16 @@ class ExLlama:
 
             chunk_size = min(remaining_q_len, effective_max_input_len)
 
-            # Limit chunk_size to keep size of attention operation <= max_attention_size
+            # Limit chunk_size to keep size of attention operation <= max_attention_size, unless using flash-attn
 
-            past_len = cache.current_seq_len
-            attn_size = (past_len + remaining_q_len) * remaining_q_len
-            max_a = self.config.max_attention_size
-            if attn_size > max_a:
-                cs = (math.sqrt(past_len ** 2 + 4 * max_a) - past_len) / 2
-                chunk_size = math.floor(cs)
+            if not self.config.use_flash_attn_2 or chunk_begin > 0:
+
+                past_len = cache.current_seq_len
+                attn_size = (past_len + remaining_q_len) * remaining_q_len
+                max_a = self.config.max_attention_size
+                if attn_size > max_a:
+                    cs = (math.sqrt(past_len ** 2 + 4 * max_a) - past_len) / 2
+                    chunk_size = min(chunk_size, math.floor(cs))
 
             # Process chunk
 
@@ -942,8 +989,6 @@ class ExLlama:
                  output_device = None,
                  input_mask = None):
 
-        assert input_mask is None or input_mask.shape == input_ids.shape
-
         # if torch.is_grad_enabled():
         #     raise ValueError("Forward pass called with gradients enabled. Back propagation is not supported yet.")
         with torch.no_grad():
@@ -958,7 +1003,9 @@ class ExLlama:
 
             devs = self.config.device_map.get_layers_devs()
 
-            if seq_len > 1:
+            # if not self.config.use_flash_attn_2:
+
+            if seq_len > 1 or input_mask is not None:
 
                 attn_mask = torch.zeros(batch_size, 1, seq_len, past_len + seq_len, dtype = torch.float16, device = devs[0])
                 attn_mask_triu = torch.triu(torch.full((seq_len - 1, seq_len - 1), -65504.))
@@ -966,6 +1013,7 @@ class ExLlama:
 
                 if input_mask is not None:
 
+                    input_mask = input_mask[:, :past_len + seq_len]
                     input_mask = _move_tensor(input_mask, devs[0], "input_mask", self.config)
                     input_mask = torch.where(input_mask, 0, -65504.).half()
                     input_mask = input_mask.unsqueeze(1).unsqueeze(2)
@@ -977,6 +1025,10 @@ class ExLlama:
                 # attn_mask = torch.zeros(batch_size, 1, seq_len, seq_len + past_len, dtype = torch.float16, device = devs[0])
 
             buffer.attn_mask = attn_mask
+
+            # else:
+            #
+            #     buffer.attn_mask = None
 
             # Embeddings
             # TODO: Allow passing input embeddings instead of IDs

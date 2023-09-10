@@ -2,6 +2,7 @@ from model import ExLlama, ExLlamaCache, ExLlamaConfig
 from tokenizer import ExLlamaTokenizer
 import argparse, sys, os, glob
 from torch import version as torch_version
+from globals import set_affinity_str
 
 def add_args(parser):
 
@@ -14,8 +15,11 @@ def add_args(parser):
     parser.add_argument("-l", "--length", type = int, help = "Maximum sequence length", default = 2048)
     parser.add_argument("-cpe", "--compress_pos_emb", type = float, help = "Compression factor for positional embeddings", default = 1.0)
     parser.add_argument("-a", "--alpha", type = float, help = "alpha for context size extension via embedding extension", default = 1.0)
+    parser.add_argument("-theta", "--theta", type = float, help = "theta (base) for RoPE embeddings")
 
     parser.add_argument("-gpfix", "--gpu_peer_fix", action = "store_true", help = "Prevent direct copies of data between GPUs")
+
+    parser.add_argument("-flash", "--flash_attn", nargs = '?', const = 'default', metavar = "METHOD", help = "Use Flash Attention with specified input length (must have Flash Attention 2.0 installed)")
 
     parser.add_argument("-mmrt", "--matmul_recons_thd", type = int, help = "No. rows at which to use reconstruction and cuBLAS for quant matmul. 0 = never, 1 = always", default = 8)
     parser.add_argument("-fmt", "--fused_mlp_thd", type = int, help = "Maximum no. of rows for which to use fused MLP. 0 = never", default = 2)
@@ -30,6 +34,8 @@ def add_args(parser):
     parser.add_argument("-nh2", "--no_half2", action = "store_true", help = "(All of the above) disable half2 in all kernela")
     parser.add_argument("-fh2", "--force_half2", action = "store_true", help = "Force enable half2 even if unsupported")
     parser.add_argument("-cs", "--concurrent_streams", action = "store_true", help = "Use concurrent CUDA streams")
+
+    parser.add_argument("-aff", "--affinity", type = str, help = "Comma-separated list, sets processor core affinity. E.g.: -aff 0,1,2,3")
 
 
 def post_parse(args):
@@ -53,10 +59,10 @@ def get_model_files(args):
         if len(st) == 0:
             print(f" !! No files matching {st_pattern}")
             sys.exit()
-        if len(st) > 1:
-            print(f" !! Multiple files matching {st_pattern}")
-            sys.exit()
-        args.model = st[0]
+        # if len(st) > 1:
+        #     print(f" !! Multiple files matching {st_pattern}")
+        #     sys.exit()
+        args.model = st
     else:
         if args.tokenizer is None or args.config is None or args.model is None:
             print(" !! Please specify either -d or all of -t, -c and -m")
@@ -65,17 +71,28 @@ def get_model_files(args):
 
 # Feedback
 
+def _common_chars(names):
+    cname = max(names, key = len)
+    for x in names:
+        for p, c in enumerate(x):
+            if c != cname[p] and cname[p] != "*": cname = cname[:p] + "*" + cname[p+1:]
+    return cname
+
 def print_options(args, extra_options = None):
 
     print_opts = []
     if args.gpu_split is not None: print_opts.append(f"gpu_split: {args.gpu_split}")
     if args.gpu_peer_fix: print_opts.append("gpu_peer_fix")
+    if args.affinity: print_opts.append(f" --affinity: {args.affinity}")
 
     if extra_options is not None: print_opts += extra_options
 
     print(f" -- Tokenizer: {args.tokenizer}")
     print(f" -- Model config: {args.config}")
-    print(f" -- Model: {args.model}")
+
+    if isinstance(args.model, str): print(f" -- Model: {args.model}")
+    else: print(f" -- Model: {_common_chars(args.model)}")
+
     print(f" -- Sequence length: {args.length}")
     if args.compress_pos_emb != 1.0:
         print(f" -- RoPE compression factor: {args.compress_pos_emb}")
@@ -84,9 +101,12 @@ def print_options(args, extra_options = None):
         print(f" -- RoPE alpha factor: {args.alpha}")
 
     print(f" -- Tuning:")
+
+    if args.flash_attn: print(f" -- --flash_attn")
+    else: print(f" -- --sdp_thd: {args.sdp_thd}" + (" (disabled)" if args.sdp_thd == 0 else ""))
+
     print(f" -- --matmul_recons_thd: {args.matmul_recons_thd}" + (" (disabled)" if args.matmul_recons_thd == 0 else ""))
     print(f" -- --fused_mlp_thd: {args.fused_mlp_thd}" + (" (disabled)" if args.fused_mlp_thd == 0 else ""))
-    print(f" -- --sdp_thd: {args.sdp_thd}" + (" (disabled)" if args.sdp_thd == 0 else ""))
     if args.matmul_fused_remap: print(f" -- --matmul_fused_remap")
     if args.no_fused_attn: print(f" -- --no_fused_attn")
     if args.rmsnorm_no_half2: print(f" -- --rmsnorm_no_half2")
@@ -112,6 +132,13 @@ def make_config(args):
     config.alpha_value = args.alpha
     config.calculate_rotary_embedding_base()
 
+    if args.flash_attn:
+        config.use_flash_attn_2 = True
+        try:
+            config.max_input_len = int(args.flash_attn)
+        except ValueError:
+            pass
+
     config.matmul_recons_thd = args.matmul_recons_thd
     config.fused_mlp_thd = args.fused_mlp_thd
     config.sdp_thd = args.sdp_thd
@@ -124,7 +151,17 @@ def make_config(args):
     config.silu_no_half2 = args.silu_no_half2
     config.concurrent_streams = args.concurrent_streams
 
+    if args.theta:
+        config.rotary_embedding_base = args.theta
+
     return config
+
+
+# Global state
+
+def set_globals(args):
+
+    if args.affinity: set_affinity_str(args.affinity)
 
 
 # Print stats after loading model

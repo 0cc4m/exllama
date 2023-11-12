@@ -33,7 +33,7 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          mamba install -y 'pytorch[version=2.0.0,build=py*_cuda11.8*]' 'pytorch-cuda=11.8' 'sentencepiece' 'cuda' 'ninja' -c 'pytorch' -c 'nvidia/label/cuda-11.8.0' -c 'nvidia' -c 'conda-forge' -c 'defaults'
+          mamba install -y 'pytorch[version=2.1.0,build=py*_cuda11.8*]' 'pytorch-cuda=11.8' 'sentencepiece' 'cuda' 'ninja' -c 'pytorch' -c 'nvidia/label/cuda-11.8.0' -c 'nvidia' -c 'conda-forge' -c 'defaults'
           python -m pip install build transformers==4.28.0 datasets safetensors accelerate==0.18.0
 
       - name: Build Wheel
